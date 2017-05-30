@@ -11,8 +11,11 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"sort"
+	"math/rand"
 )
 
 // Target is an HTTP request blueprint.
@@ -21,7 +24,14 @@ type Target struct {
 	URL    string
 	Body   []byte
 	Header http.Header
+	Percentage float64
+	PercentageFlag bool
 }
+
+type ByPercentage []Target
+func (a ByPercentage) Len() int           { return len(a) }
+func (a ByPercentage) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByPercentage) Less(i, j int) bool { return a[i].Percentage < a[j].Percentage }
 
 // Request creates an *http.Request out of Target and returns it along with an
 // error in case of failure.
@@ -45,6 +55,10 @@ var (
 	ErrNoTargets = errors.New("no targets to attack")
 	// ErrNilTarget is returned when the passed Target pointer is nil.
 	ErrNilTarget = errors.New("nil target")
+	// ErrPercentageMore100 is returned when total percentage more than 100.
+	ErrPercentageMore100 = errors.New("total percentage more than 100")
+	// ErrPercentageLess100 is returned when total percentage less than 100.
+	ErrPercentageLess100 = errors.New("total percentage less than 100")
 )
 
 // A Targeter decodes a Target or returns an error in case of failure.
@@ -64,6 +78,51 @@ func NewStaticTargeter(tgts ...Target) Targeter {
 	}
 }
 
+// NewStaticPercentageTargeter returns a Targeter which emmit Targets
+// according to provided distribution.
+func NewStaticPercentageTargeter(tgts ...Target) (Targeter, error) {
+	totalPercentage := float64(0)
+	nilPercentageCount := int64(0)
+	for j := 1; j < len(tgts); j += 1 {
+		if (tgts[j].PercentageFlag) {
+			totalPercentage += tgts[j].Percentage
+		} else {
+			nilPercentageCount += 1
+		}
+	}
+	if (totalPercentage > 100) {
+		return nil, ErrPercentageMore100
+	}
+	if (totalPercentage < 100) {
+		if (nilPercentageCount > 0) {
+			reminderPercentage := (100 - totalPercentage)/float64(nilPercentageCount)
+			for j := 1; j < len(tgts); j += 1 {
+				if (tgts[j].PercentageFlag) {
+					tgts[j].Percentage = reminderPercentage
+				}
+			}
+		} else {
+			return nil, ErrPercentageLess100
+		}
+	}
+	sort.Sort(ByPercentage(tgts))
+	rand.Seed(int64(42*len(tgts)))
+
+	return func(tgt *Target) error {
+		if tgt == nil {
+			return ErrNilTarget
+		}
+		percentage := rand.Float64()*100
+		for j := 1; j < len(tgts); j += 1 {
+			if percentage < tgts[j].Percentage {
+				*tgt = tgts[j]
+				break
+			}
+		}
+		return nil
+	}, nil
+}
+
 // NewEagerTargeter eagerly reads all Targets out of the provided io.Reader and
 // returns a NewStaticTargeter with them.
 //
@@ -75,6 +134,7 @@ func NewEagerTargeter(src io.Reader, body []byte, header http.Header) (Targeter,
 		tgts []Target
 		tgt  Target
 		err  error
+		percentage = false
 	)
 	for {
 		if err = sc(&tgt); err == ErrNoTargets {
@@ -83,11 +143,18 @@ func NewEagerTargeter(src io.Reader, body []byte, header http.Header) (Targeter,
 			return nil, err
 		}
 		tgts = append(tgts, tgt)
+		if tgt.PercentageFlag {
+			percentage = true
+		}
 	}
 	if len(tgts) == 0 {
 		return nil, ErrNoTargets
 	}
-	return NewStaticTargeter(tgts...), nil
+	if percentage {
+		return NewStaticPercentageTargeter(tgts...)
+	} else {
+		return NewStaticTargeter(tgts...), nil
+	}
 }
 
 // NewLazyTargeter returns a new Targeter that lazily scans Targets from the
@@ -146,6 +213,12 @@ func NewLazyTargeter(src io.Reader, body []byte, hdr http.Header) Targeter {
 				if tgt.Body, err = ioutil.ReadFile(line[1:]); err != nil {
 					return fmt.Errorf("bad body: %s", err)
 				}
+				break
+			} else if strings.HasPrefix(line, "%") {
+				if tgt.Percentage, err = strconv.ParseFloat(line[1:], 3); err != nil {
+					return fmt.Errorf("bad percentage: %s", err)
+				}
+				tgt.PercentageFlag = true
 				break
 			}
 			tokens = strings.SplitN(line, ":", 2)
